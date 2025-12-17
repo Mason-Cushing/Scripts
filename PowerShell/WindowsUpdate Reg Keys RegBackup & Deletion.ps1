@@ -1,4 +1,4 @@
-# Requires TOOL - Check WindowsUpdate Reg Keys(.JSON Backup) to have been ran already
+# Requires Check WindowsUpdate Reg Keys(.JSON Backup) to have been ran already
 # Created by Mason Cushing
 # On 8-6-2025
 
