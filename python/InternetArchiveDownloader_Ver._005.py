@@ -1,0 +1,531 @@
+# Created by Mason Cushing on 2026-03-13
+# ================== Interactive Archive Manager GUI ==================
+import os
+import sys
+import subprocess
+import threading
+import time
+import queue
+
+def install(pkg):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+try:
+    import requests
+except:
+    install("requests")
+    import requests
+
+try:
+    import internetarchive
+except:
+    install("internetarchive")
+    import internetarchive
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from internetarchive import get_item, search_items
+
+# ================== Download Task ==================
+class DownloadTask:
+    MAX_RETRIES = 5
+    CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks
+    MIRRORS = [
+        "https://archive.org/download",
+        "https://ia800504.us.archive.org",
+        "https://ia600504.us.archive.org",
+        "https://ia902804.us.archive.org"
+    ]
+
+    def __init__(self, item_id, file_info, save_folder, gui_queue):
+        self.item_id = item_id
+        self.file_info = file_info
+        self.save_folder = save_folder
+        self.gui_queue = gui_queue
+        self.filename = file_info['name']
+        self.size = int(file_info.get('size', 0))
+        self.ia_md5 = file_info.get("md5")
+        self.downloaded = 0
+        self.status = "Pending"
+        self.speed = 0
+        self.pause_flag = threading.Event()
+        self.cancel_flag = threading.Event()
+        self.last_update_time = time.time()
+        self.last_downloaded = 0
+        self.selected = False
+
+    def pause(self):
+        self.pause_flag.set()
+        if self.status == "Downloading":
+            self.status = "Paused"
+
+    def resume(self):
+        self.pause_flag.clear()
+        if self.status == "Paused":
+            self.status = "Downloading"
+
+    def cancel(self):
+        self.cancel_flag.set()
+        self.status = "Canceled"
+
+    def verify_md5(self, filepath):
+        if not self.ia_md5:
+            return True
+        import hashlib
+        md5 = hashlib.md5()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(1024*1024), b""):
+                md5.update(chunk)
+        return md5.hexdigest() == self.ia_md5
+
+    def download(self):
+        if not self.save_folder:
+            self.status = "Error"
+            self.gui_queue.put(lambda: None)
+            return
+
+        import requests
+        from urllib.parse import quote
+        import os
+        import time
+
+        temp_path = os.path.join(self.save_folder, self.filename + ".part")
+        final_path = os.path.join(self.save_folder, self.filename)
+        retries = 0
+
+        while retries < self.MAX_RETRIES and not self.cancel_flag.is_set():
+            for mirror in self.MIRRORS:
+                encoded_filename = quote(self.filename)
+                url = f"{mirror}/{self.item_id}/{encoded_filename}"
+                headers = {}
+                if os.path.exists(temp_path):
+                    self.downloaded = os.path.getsize(temp_path)
+                    headers["Range"] = f"bytes={self.downloaded}-"
+                try:
+                    self.status = "Downloading"
+                    with requests.get(url, stream=True, headers=headers, timeout=60) as r:
+                        if r.status_code == 416:  # Range not satisfiable
+                            headers = {}
+                            self.downloaded = 0
+                            r = requests.get(url, stream=True, timeout=60)
+
+                        r.raise_for_status()
+                        mode = "ab" if self.downloaded else "wb"
+                        with open(temp_path, mode) as f:
+                            for chunk in r.iter_content(self.CHUNK_SIZE):
+                                while self.pause_flag.is_set():
+                                    time.sleep(0.1)
+                                if self.cancel_flag.is_set():
+                                    self.gui_queue.put(lambda: None)
+                                    return
+                                if chunk:
+                                    f.write(chunk)
+                                    self.downloaded += len(chunk)
+                                    now = time.time()
+                                    if now - self.last_update_time > 0.5:
+                                        self.speed = (self.downloaded - self.last_downloaded) / (now - self.last_update_time)
+                                        self.last_update_time = now
+                                        self.last_downloaded = self.downloaded
+                                        self.gui_queue.put(lambda: None)
+
+                    os.rename(temp_path, final_path)
+                    if not self.verify_md5(final_path):
+                        os.remove(final_path)
+                        raise Exception("Checksum mismatch")
+
+                    self.downloaded = self.size
+                    self.speed = 0
+                    self.status = "Completed"
+                    self.selected = False
+                    self.gui_queue.put(lambda: None)
+                    return
+
+                except Exception as e:
+                    print("Download error:", e)
+                    retries += 1
+                    time.sleep(2)
+
+        self.status = "Error"
+        self.speed = 0
+        self.gui_queue.put(lambda: None)
+
+# ================== GUI ==================
+class ArchiveManagerGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Internet Archive Downloader")
+        self.root.geometry("1500x800")
+        self.root.configure(bg="#0a0a0a")
+
+        self.tasks = []
+        self.download_queue = queue.Queue()
+        self.gui_update_queue = queue.Queue()
+        self.running = False
+        self.save_folder = None
+        self.search_results = []
+        self.max_concurrent_downloads = 16
+
+        self.fg_color = "#00ff00"
+        self.frame_bg = "#0a0a0a"
+        self.button_bg = "#111111"
+        self.button_fg = "#00ff00"
+        self.list_bg_empty = "#003300"
+        self.entry_bg = "#003300"
+
+        # -------- Top Controls ----------
+        top_frame = tk.Frame(root, bg=self.frame_bg)
+        top_frame.pack(fill="x", padx=10, pady=5)
+        tk.Label(top_frame, text="Search / Collection:", bg=self.frame_bg, fg=self.fg_color).pack(side="left")
+
+        self.search_entry = tk.Entry(top_frame, width=40, bg=self.entry_bg, fg=self.fg_color, insertbackground=self.fg_color)
+        self.search_entry.pack(side="left", padx=5)
+
+        # store the button so we can disable/enable during searches
+        self.search_button = tk.Button(
+            top_frame, text="Search", bg=self.button_bg, fg=self.button_fg,
+            activebackground="#222222", activeforeground=self.button_fg,
+            command=self.start_search_thread
+        )
+        self.search_button.pack(side="left", padx=5)
+
+        tk.Button(top_frame, text="Choose Folder", bg=self.button_bg, fg=self.button_fg,
+                  activebackground="#222222", activeforeground=self.button_fg,
+                  command=self.choose_folder).pack(side="left", padx=5)
+
+        tk.Label(top_frame, text="Filter by Type:", bg=self.frame_bg, fg=self.fg_color).pack(side="left", padx=5)
+        self.filetype_var = tk.StringVar()
+        self.filetype_dropdown = ttk.Combobox(top_frame, textvariable=self.filetype_var, width=10, state="readonly")
+        self.filetype_dropdown['values'] = ("All", ".cso", ".iso", ".zip", ".7z", ".rar", ".chd", ".bin", ".cue")
+        self.filetype_dropdown.current(0)
+        self.filetype_dropdown.pack(side="left", padx=2)
+
+        # -------- Search Results ----------
+        results_frame = tk.Frame(root, bg=self.frame_bg)
+        results_frame.pack(fill="x", padx=10, pady=5)
+        tk.Label(results_frame, text="Search Results:", bg=self.frame_bg, fg=self.fg_color).pack(anchor="w")
+
+        self.results_listbox = tk.Listbox(
+            results_frame,
+            selectmode=tk.SINGLE,
+            bg=self.list_bg_empty,
+            fg=self.fg_color,
+            selectbackground="#009900",
+            selectforeground=self.fg_color,
+            highlightbackground=self.list_bg_empty,
+            relief="flat"
+        )
+        self.results_listbox.pack(fill="x", pady=5)
+
+        tk.Button(results_frame, text="Fetch Selected Item Files",
+                  bg=self.list_bg_empty, fg=self.fg_color,
+                  activebackground="#004400", activeforeground=self.fg_color,
+                  command=self.fetch_selected_files).pack(pady=5)
+
+        # -------- File Treeview ----------
+        tree_frame = tk.Frame(root, bg=self.frame_bg)
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        columns = ("selected", "filename", "size", "progress", "speed", "status")
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
+        for col in columns:
+            self.tree.heading(col, text=col.title(), command=lambda _c=col: self.treeview_sort_column(_c, False))
+        self.tree.column("selected", width=80, anchor="center")
+        self.tree.column("filename", width=400)
+        self.tree.column("size", width=100, anchor="center")
+        self.tree.column("progress", width=120, anchor="center")
+        self.tree.column("speed", width=80, anchor="center")
+        self.tree.column("status", width=100, anchor="center")
+        self.tree.pack(fill="both", expand=True, side="left")
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscroll=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+
+        self.tree.tag_configure('even', background="#047700")
+        self.tree.tag_configure('odd', background="#0D5C02")
+        self.tree.tag_configure('error', background="#330000", foreground="#ff5555")
+
+        style = ttk.Style()
+        style.theme_use("clam")  # "clam" allows custom colors on Treeview
+
+        # ---------------- Rows ----------------
+        style.configure("Treeview", 
+                        background="#003300",       # row background
+                        fieldbackground="#003300",  # empty area background
+                        foreground="#00ff00")       # row text color (bright green)
+        
+        # Selection highlight
+        style.map("Treeview",
+                  background=[('selected', '#006600')], # selected row dark green
+                  foreground=[('selected', '#ffffff')]) # selected row text white
+        
+        # ---------------- Column Headers ----------------
+        style.configure("Treeview.Heading", 
+                        background="#003300",   # header background
+                        foreground="#00ff00",   # header text color
+                        relief="raised")        # optional 3D effect
+        
+        # Optional: change header on hover
+        style.map("Treeview.Heading",
+                  background=[('active', '#004400')],   # hover/active header color
+                  foreground=[('active', '#ffffff')])
+
+        # Bind click to toggle checkbox
+        self.tree.bind("<Button-1>", self.on_tree_click)
+
+        # -------- Bottom Controls ----------
+        bottom_frame = tk.Frame(root, bg=self.frame_bg)
+        bottom_frame.pack(fill="x", padx=10, pady=5)
+        tk.Button(bottom_frame, text="Select All", command=self.select_all).pack(side="left")
+        tk.Button(bottom_frame, text="Deselect All", command=self.deselect_all).pack(side="left")
+        tk.Button(bottom_frame, text="Start Downloads", command=self.start_downloads).pack(side="left")
+        tk.Button(bottom_frame, text="Pause Selected", command=self.pause_selected).pack(side="left")
+        tk.Button(bottom_frame, text="Resume Selected", command=self.resume_selected).pack(side="left")
+        tk.Button(bottom_frame, text="Cancel Selected", command=self.cancel_selected).pack(side="left")
+
+        self.overall_progress = ttk.Progressbar(root)
+        self.overall_progress.pack(fill="x", padx=10, pady=5)
+
+        self.status_label = tk.Label(root, text="Idle", bg=self.frame_bg, fg=self.fg_color)
+        self.status_label.pack()
+
+        self.root.after(500, self.refresh_treeview)
+
+    # ---------------- Threaded search ----------------
+    def start_search_thread(self):
+        query = self.search_entry.get().strip()
+        if not query:
+            messagebox.showerror("Error", "Enter search query or collection ID")
+            return
+        self.search_button.config(state="disabled")
+        self.results_listbox.delete(0, tk.END)
+        threading.Thread(target=self._search_thread, args=(query,), daemon=True).start()
+
+    def _search_thread(self, query):
+        try:
+            items = search_items(query)
+            results = list(items)[:50]
+            self.root.after(0, lambda: self._populate_search_results(results))
+        finally:
+            self.root.after(0, lambda: self.search_button.config(state="normal"))
+
+    def _populate_search_results(self, results):
+        self.search_results = results
+        self.results_listbox.delete(0, tk.END)
+        for item in self.search_results:
+            title = item.get('title', 'No Title')
+            identifier = item['identifier']
+            self.results_listbox.insert(tk.END, f"{identifier} | {title}")
+
+    # ---------------- Checkbox click handler ----------------
+    def on_tree_click(self, event):
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        column = self.tree.identify_column(event.x)
+        if column != "#1":  # Only first column (selected)
+            return
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        idx = self.tree.index(row)
+        task = self.tasks[idx]
+        task.selected = not task.selected
+        self.tree.set(row, "selected", "[x]" if task.selected else "[ ]")
+
+    # ---------------- GUI methods ----------------
+    def select_all(self):
+        for t in self.tasks:
+            t.selected = True
+
+    def deselect_all(self):
+        for t in self.tasks:
+            t.selected = False
+
+    def choose_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.save_folder = folder
+            for t in self.tasks:
+                t.save_folder = folder
+
+    def perform_search(self):
+        query = self.search_entry.get().strip()
+        if not query:
+            messagebox.showerror("Error", "Enter search query or collection ID")
+            return
+
+        self.search_button.config(state="disabled")  # disable button during search
+        self.results_listbox.delete(0, tk.END)
+        threading.Thread(target=self._search_thread, args=(query,), daemon=True).start()
+
+    def _search_thread(self, query):
+        from internetarchive import search_items
+        try:
+            items = search_items(query)
+            results = list(items)[:50]
+            self.root.after(0, lambda: self._populate_search_results(results))
+        finally:
+            self.root.after(0, lambda: self.search_button.config(state="normal"))
+
+    def _populate_search_results(self, results):
+        self.search_results = results
+        self.results_listbox.delete(0, tk.END)
+        for item in self.search_results:
+            title = item.get('title', 'No Title')
+            identifier = item['identifier']
+            self.results_listbox.insert(tk.END, f"{identifier} | {title}")
+
+    def fetch_selected_files(self):
+
+        if not self.save_folder:
+            messagebox.showinfo("Info", "Please choose a folder first.")
+            self.choose_folder()
+            if not self.save_folder:
+                return
+
+        indices = self.results_listbox.curselection()
+        if not indices:
+            messagebox.showerror("Error", "Select a collection")
+            return
+        
+        # Clear previous tasks and treeview
+        self.tasks.clear()
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+
+        filter_type = self.filetype_var.get().strip().lower()
+        idx = indices[0]
+        item_id = self.search_results[idx]['identifier']
+        item = get_item(item_id)
+        for i, f in enumerate(item.files):
+            fname_lower = f['name'].lower()
+            if filter_type != "all" and not fname_lower.endswith(filter_type):
+                continue
+            f['item_id'] = item_id
+            size_mb = int(f.get('size', 0)) / 1024 / 1024
+            tag = 'even' if i % 2 == 0 else 'odd'
+
+            task = DownloadTask(item_id, f, self.save_folder, self.gui_update_queue)
+            self.tasks.append(task)
+
+            self.tree.insert(
+                "",
+                "end",
+                values=("[ ]", f['name'], f"{size_mb:.2f} MB", "0%", "0 MB/s", "Pending")
+            )
+
+    # ---------------- Pause/Resume/Cancel ----------------
+    def pause_selected(self):
+        for t in self.tasks:
+            if t.selected:
+                t.pause()
+
+    def resume_selected(self):
+        for t in self.tasks:
+            if t.selected:
+                t.resume()
+
+        if not self.running:
+            self.running = True
+            for _ in range(self.max_concurrent_downloads):
+                threading.Thread(target=self.worker, daemon=True).start()
+
+    def cancel_selected(self):
+        for t in self.tasks:
+            if t.selected:
+                t.cancel()
+                t.selected = False
+
+    # ---------------- Downloads ----------------
+    def start_downloads(self):
+        if not self.save_folder:
+            messagebox.showinfo("Info", "Please choose a folder first.")
+            self.choose_folder()
+            if not self.save_folder:
+                return
+
+        self.download_queue = queue.Queue()
+        queued_any = False
+        for t in self.tasks:
+            if t.selected and t.status in ["Pending", "Paused", "Error"]:
+                self.download_queue.put(t)
+                queued_any = True
+
+        if not queued_any:
+            messagebox.showinfo("Info", "No files selected.")
+            return
+
+        if not self.running:
+            self.running = True
+            for _ in range(self.max_concurrent_downloads):
+                threading.Thread(target=self.worker, daemon=True).start()
+
+    def worker(self):
+        while True:
+            try:
+                task = self.download_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if task.status not in ["Completed", "Canceled"]:
+                    task.download()
+            finally:
+                self.download_queue.task_done()
+        self.running = False
+
+    # -------- Treeview Sorting ----------
+    def treeview_sort_column(self, col, reverse):
+        data_list = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
+        if col in ['size', 'progress', 'speed']:
+            def conv(x):
+                try:
+                    return float(x[0].replace(' MB','').replace('%','').replace(' MB/s',''))
+                except: return 0
+            data_list.sort(key=conv, reverse=reverse)
+        else:
+            data_list.sort(key=lambda t: t[0], reverse=reverse)
+        for index, (val, k) in enumerate(data_list):
+            self.tree.move(k, '', index)
+        self.tree.heading(col, command=lambda: self.treeview_sort_column(col, not reverse))
+
+    # ---------------- GUI refresh ----------------
+    def refresh_treeview(self):
+        total_bytes = sum(t.size for t in self.tasks)
+        downloaded_bytes = sum(t.downloaded for t in self.tasks)
+        overall_percent = downloaded_bytes/total_bytes*100 if total_bytes else 0
+        self.overall_progress['value'] = overall_percent
+
+        total_speed = sum(t.speed for t in self.tasks if t.status=="Downloading")
+        eta_sec = (total_bytes-downloaded_bytes)/total_speed if total_speed>0 else 0
+        eta_text = f"ETA: {int(eta_sec//60)}m {int(eta_sec%60)}s" if eta_sec>0 else "Idle"
+        self.status_label.config(text=eta_text)
+
+        for i, t in enumerate(self.tasks):
+            item_id = self.tree.get_children()[i]
+            # Update checkbox
+            self.tree.set(item_id, "selected", "[x]" if t.selected else "[ ]")
+            # Update speed
+            speed_text = f"{t.speed/1024/1024:.2f} MB/s" if t.status=="Downloading" else "0 MB/s"
+            self.tree.set(item_id, "speed", speed_text)
+            # Update status
+            self.tree.set(item_id, "status", t.status)
+            # Update progress bar using blocks
+            pct = int(t.downloaded/t.size*100) if t.size else 0
+            blocks = int(pct/5)  # 20 blocks total
+            progress_str = "█"*blocks + " "*(20-blocks) + f" {pct}%"
+            self.tree.set(item_id, "progress", progress_str)
+
+            # Tag colors
+            if t.status=="Error":
+                self.tree.item(item_id, tags=('error',))
+            else:
+                tag = 'even' if i%2==0 else 'odd'
+                self.tree.item(item_id, tags=(tag,))
+
+        self.root.after(500, self.refresh_treeview)
+
+
+# ================== Run ==================
+root = tk.Tk()
+app = ArchiveManagerGUI(root)
+root.mainloop()
